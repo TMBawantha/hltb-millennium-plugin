@@ -3,8 +3,9 @@ import type { PluginSettings } from '../services/settings';
 
 const CONTAINER_ID = 'hltb-for-millennium';
 
+// Also defined in webkit/storePage.ts (separate build target, can't share code)
 function formatTime(hours: number | null | undefined): string {
-  if (!hours || hours === 0) return '--';
+  if (hours == null || hours <= 0) return '--';
   if (hours < 1) {
     const mins = Math.round(hours * 60);
     return `${mins}m`;
@@ -33,6 +34,13 @@ export function createDisplay(
   } else {
     container.style.left = `${settings.horizontalOffset}px`;
     container.style.right = 'auto';
+  }
+  if (settings.alignBottom) {
+    container.style.bottom = `${settings.verticalOffset}px`;
+    container.style.top = 'auto';
+  } else {
+    container.style.top = `${settings.verticalOffset}px`;
+    container.style.bottom = 'auto';
   }
 
   const stats = [

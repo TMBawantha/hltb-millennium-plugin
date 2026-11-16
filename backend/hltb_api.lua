@@ -18,24 +18,23 @@ M.SEARCH_SIZE = 20   -- Number of results to request per search
 -- Exposed for testing; defaults to real http module
 M._http = http
 
--- Auth token cache
-local cached_token = nil
-local token_expires_at = 0
+-- Auth struct cache: { token, key, value }
+local cached_auth = nil
+local auth_expires_at = 0
 
--- Get auth token
-function M.get_auth_token(force_refresh)
-    local now = os.time()
-
-    if not force_refresh and cached_token and now < token_expires_at then
-        return cached_token, nil
+-- Single attempt at fetching the auth token. Used by get_auth, which retries
+-- once with an invalidated endpoint cache if the first attempt fails.
+local function fetch_auth_once()
+    local init_url = endpoints.get_init_url()
+    if not init_url then
+        return nil, "endpoint discovery failed"
     end
 
+    local timestamp_ms = math.floor(os.time() * 1000)
+    local url = init_url .. "?t=" .. timestamp_ms
     logger:info("Fetching auth token...")
 
-    local timestamp_ms = math.floor(now * 1000)
-    local url = endpoints.BASE_URL .. "api/search/init?t=" .. timestamp_ms
-
-    local response, err = http.get(url, {
+    local response, err = M._http.get(url, {
         headers = {
             ["User-Agent"] = endpoints.USER_AGENT,
             ["referer"] = endpoints.REFERER_HEADER
@@ -60,16 +59,43 @@ function M.get_auth_token(force_refresh)
         return nil, "No token in response"
     end
 
-    cached_token = data.token
-    token_expires_at = now + M.TOKEN_TTL
-    logger:info("Got auth token")
+    return {
+        token = data.token,
+        key = data.hpKey,
+        value = data.hpVal
+    }, nil
+end
 
-    return data.token, nil
+-- Get auth struct (token + key/value pair).
+-- On the first failure we invalidate the endpoint discovery cache and retry
+-- once, in case HLTB rotated the API endpoint name mid-session.
+function M.get_auth(force_refresh)
+    local now = os.time()
+
+    if not force_refresh and cached_auth and now < auth_expires_at then
+        return cached_auth, nil
+    end
+
+    local auth, err = fetch_auth_once()
+    if not auth then
+        logger:info("Auth fetch failed (" .. err .. "), re-detecting endpoint and retrying")
+        endpoints.invalidate()
+        auth, err = fetch_auth_once()
+        if not auth then
+            return nil, err
+        end
+    end
+
+    cached_auth = auth
+    auth_expires_at = now + M.TOKEN_TTL
+    logger:info("Got auth token" .. (auth.key and " with key/value" or ""))
+
+    return cached_auth, nil
 end
 
 -- Build search payload matching HLTB's expected API format.
 -- The searchOptions structure mirrors what the HLTB website sends.
-local function get_search_request_data(game_name, modifier, page)
+local function get_search_request_data(game_name, modifier, page, auth)
     modifier = modifier or ""
     page = page or 1
 
@@ -108,11 +134,16 @@ local function get_search_request_data(game_name, modifier, page)
         useCache = true
     }
 
+    -- Include auth key/value in the payload body
+    if auth and auth.key and auth.value then
+        payload[tostring(auth.key)] = auth.value
+    end
+
     return json.encode(payload)
 end
 
 -- Build search headers
-local function get_search_request_headers(auth_token)
+local function get_search_request_headers(auth)
     local headers = {
         ["Content-Type"] = "application/json",
         ["Origin"] = "https://howlongtobeat.com",
@@ -121,38 +152,66 @@ local function get_search_request_headers(auth_token)
         ["User-Agent"] = endpoints.USER_AGENT
     }
 
-    if auth_token then
-        headers["x-auth-token"] = auth_token
+    if auth then
+        headers["x-auth-token"] = auth.token
+        if auth.key then
+            headers["x-hp-key"] = tostring(auth.key)
+        end
+        if auth.value then
+            headers["x-hp-val"] = tostring(auth.value)
+        end
     end
 
     return headers
 end
 
--- Search HLTB
-function M.search(query, options)
-    options = options or {}
-    local page = options.page or 1
-    local modifier = options.modifier or ""
-
-    local auth_token = M.get_auth_token()
-    if not auth_token then
-        logger:info("Failed to get auth token")
-        return nil
+-- Single attempt at a search request. Returns response, err.
+local function search_once(query, options)
+    local auth, auth_err = M.get_auth()
+    if not auth then
+        return nil, "auth: " .. (auth_err or "unknown")
     end
 
-    local headers = get_search_request_headers(auth_token)
     local search_url = endpoints.get_search_url()
-    local payload = get_search_request_data(query, modifier, page)
+    if not search_url then
+        return nil, "endpoint discovery failed"
+    end
 
-    local response, err = http.request(search_url, {
+    local headers = get_search_request_headers(auth)
+    local payload = get_search_request_data(query, options.modifier or "", options.page or 1, auth)
+
+    return M._http.request(search_url, {
         method = "POST",
         headers = headers,
         data = payload,
         timeout = endpoints.TIMEOUT
     })
+end
+
+-- Search HLTB.
+-- Failure handling has two retry triggers:
+--   1) HTTP 403 -> token expired server-side, refresh auth and retry once.
+--   2) Any other failure (transport error, non-200) -> assume HLTB rotated
+--      the endpoint, invalidate discovery, and retry once.
+function M.search(query, options)
+    options = options or {}
+
+    local response, err = search_once(query, options)
+
+    if response and response.status == 403 then
+        logger:info("Search returned 403, refreshing auth and retrying")
+        M.clear_cache()
+        response, err = search_once(query, options)
+    elseif (not response) or response.status ~= 200 then
+        local desc = response and ("HTTP " .. response.status) or (err or "unknown")
+        logger:info("Search failed (" .. desc .. "), re-detecting endpoint and retrying")
+        endpoints.invalidate()
+        M.clear_cache()
+        response, err = search_once(query, options)
+    end
 
     if not response then
-        logger:info("Search request failed: " .. (err or "unknown"))
+        logger:info("Search retry failed: " .. (err or "unknown"))
         return nil
     end
 
@@ -191,25 +250,35 @@ function M.search(query, options)
     return data
 end
 
--- Fetch game data by game ID (for Steam ID verification)
-function M.fetch_game_data(game_id)
+-- Fetch game data by game ID (for Steam ID verification).
+-- Same retry-on-failure semantics as fetch_game_by_id: invalidate the
+-- discovery cache (which holds the build ID) and retry once.
+local function fetch_game_data_once(game_id)
     local build_id = endpoints.get_build_id()
     if not build_id then
-        return nil
+        return nil, "no build_id"
     end
 
     local url = endpoints.BASE_URL .. "_next/data/" .. build_id .. "/game/" .. game_id .. ".json"
     logger:info("Fetching game data: " .. url)
 
-    local headers = {
-        ["User-Agent"] = endpoints.USER_AGENT,
-        ["referer"] = endpoints.REFERER_HEADER
-    }
-
-    local response, err = http.get(url, {
-        headers = headers,
+    return M._http.get(url, {
+        headers = {
+            ["User-Agent"] = endpoints.USER_AGENT,
+            ["referer"] = endpoints.REFERER_HEADER
+        },
         timeout = endpoints.TIMEOUT
     })
+end
+
+function M.fetch_game_data(game_id)
+    local response, err = fetch_game_data_once(game_id)
+    if (not response) or response.status ~= 200 then
+        local desc = response and ("HTTP " .. response.status) or (err or "unknown")
+        logger:info("Game data fetch failed (" .. desc .. "), re-detecting build ID and retrying")
+        endpoints.invalidate()
+        response, err = fetch_game_data_once(game_id)
+    end
 
     if not response then
         logger:info("Game data request failed: " .. (err or "unknown"))
@@ -328,6 +397,24 @@ function M.fetch_steam_import(steam_user_id)
     return data.games, nil
 end
 
+-- Single attempt at fetching game data by HLTB ID.
+local function fetch_game_by_id_once(game_id)
+    local build_id = endpoints.get_build_id()
+    if not build_id then
+        return nil, "Could not get build ID"
+    end
+
+    local url = endpoints.BASE_URL .. "_next/data/" .. build_id .. "/game/" .. game_id .. ".json"
+
+    return M._http.get(url, {
+        headers = {
+            ["User-Agent"] = endpoints.USER_AGENT,
+            ["referer"] = endpoints.REFERER_HEADER
+        },
+        timeout = endpoints.TIMEOUT
+    })
+end
+
 -- Fetch game completion times directly by HLTB game ID.
 --
 -- Uses HLTB's NextJS data endpoint to get full game details including
@@ -338,6 +425,10 @@ end
 --
 -- API endpoint: GET https://howlongtobeat.com/_next/data/{buildId}/game/{gameId}.json
 -- Returns: Normalized game data with game_id, game_name, comp_main, comp_plus, comp_100.
+--
+-- On failure we invalidate the endpoint discovery cache (which includes the
+-- NextJS build ID) and retry once, since HLTB rotates the build ID on each
+-- deploy.
 function M.fetch_game_by_id(game_id)
     if not game_id then
         return nil, "No game ID provided"
@@ -345,22 +436,13 @@ function M.fetch_game_by_id(game_id)
 
     logger:info("Fetching game data for HLTB ID: " .. tostring(game_id))
 
-    local build_id = endpoints.get_build_id()
-    if not build_id then
-        return nil, "Could not get build ID"
+    local response, err = fetch_game_by_id_once(game_id)
+    if (not response) or response.status ~= 200 then
+        local desc = response and ("HTTP " .. response.status) or (err or "unknown")
+        logger:info("Game data fetch failed (" .. desc .. "), re-detecting build ID and retrying")
+        endpoints.invalidate()
+        response, err = fetch_game_by_id_once(game_id)
     end
-
-    local url = endpoints.BASE_URL .. "_next/data/" .. build_id .. "/game/" .. game_id .. ".json"
-
-    local headers = {
-        ["User-Agent"] = endpoints.USER_AGENT,
-        ["referer"] = endpoints.REFERER_HEADER
-    }
-
-    local response, err = M._http.get(url, {
-        headers = headers,
-        timeout = endpoints.TIMEOUT
-    })
 
     if not response then
         return nil, "Request failed: " .. (err or "unknown")
@@ -399,10 +481,10 @@ function M.fetch_game_by_id(game_id)
     }, nil
 end
 
--- Clear cached auth token
+-- Clear cached auth
 function M.clear_cache()
-    cached_token = nil
-    token_expires_at = 0
+    cached_auth = nil
+    auth_expires_at = 0
 end
 
 return M

@@ -1,6 +1,8 @@
+import { callable } from '@steambrew/client';
 import { log } from '../services/logger';
-import { LIBRARY_SELECTORS } from '../types';
-import { clearCache, getCacheStats } from '../services/cache';
+
+const ClearCacheRpc = callable<[], string>('ClearCache');
+const GetCacheStatsRpc = callable<[], string>('GetCacheStats');
 
 function logDOMStructure(doc: Document, selector?: string): void {
   log('=== DOM Structure Debug ===');
@@ -37,7 +39,7 @@ function logDOMStructure(doc: Document, selector?: string): void {
 export function exposeDebugTools(doc: Document): void {
   const debugObj = {
     logDOM: (selector?: string) => logDOMStructure(doc, selector),
-    getSelectors: () => LIBRARY_SELECTORS,
+    getSelectors: () => 'Selectors are internal to detector.ts — inspect source directly',
     findImages: () => {
       const images = doc.querySelectorAll('img');
       images.forEach((img, i) => {
@@ -65,18 +67,34 @@ export function exposeDebugTools(doc: Document): void {
         log(`  [${i}] ${child.tagName}.${child.className.split(' ')[0] || '(no class)'}`);
       });
     },
-    clearCache: () => {
-      clearCache();
-      log('Cache cleared. Refresh or navigate to a game to fetch fresh data.');
-    },
-    cacheStats: () => {
-      const stats = getCacheStats();
-      log('Cache entries:', stats.count);
-      if (stats.oldestTimestamp) {
-        const age = Math.round((Date.now() - stats.oldestTimestamp) / (1000 * 60 * 60 * 24));
-        log('Oldest entry:', age, 'days old');
+    clearCache: async () => {
+      try {
+        await ClearCacheRpc();
+        log('Cache cleared. Refresh or navigate to a game to fetch fresh data.');
+      } catch (e) {
+        log('Failed to clear cache:', e);
       }
-      return stats;
+    },
+    cacheStats: async () => {
+      try {
+        const resultJson = await GetCacheStatsRpc();
+        const result = JSON.parse(resultJson);
+        if (!result.success) {
+          log('Failed to get cache stats');
+          return null;
+        }
+        const { resultCache, idCache } = result.data;
+        log('Cache entries:', resultCache.count);
+        if (resultCache.oldestTimestamp) {
+          const age = Math.round((Date.now() / 1000 - resultCache.oldestTimestamp) / (60 * 60 * 24));
+          log('Oldest entry:', age, 'days old');
+        }
+        log('ID mappings:', idCache.count);
+        return result.data;
+      } catch {
+        log('Failed to get cache stats');
+        return null;
+      }
     },
   };
 

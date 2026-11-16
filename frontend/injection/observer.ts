@@ -1,9 +1,8 @@
-import type { LibrarySelectors } from '../types';
+import type { HltbGameResult, UIMode } from '../types';
 import { log } from '../services/logger';
 import { fetchHltbData } from '../services/hltbApi';
-import { getCache } from '../services/cache';
 import { getSettings } from '../services/settings';
-import { detectGamePage } from './detector';
+import { detectGamePage, setRoutePatchData, clearRoutePatchData } from './detector';
 import {
   createDisplay,
   getExistingDisplay,
@@ -12,38 +11,61 @@ import {
 import { injectStyles } from '../display/styles';
 
 let currentAppId: number | null = null;
+let currentData: HltbGameResult | null = null;
 let processingAppId: number | null = null;
 let currentDoc: Document | null = null;
+let currentMode: UIMode | null = null;
 let observer: MutationObserver | null = null;
+let routePatchCleanup: (() => void) | null = null;
 
 export function resetState(): void {
   currentAppId = null;
+  currentData = null;
   processingAppId = null;
   currentDoc = null;
+  currentMode = null;
+  clearRoutePatchData();
 }
 
 export function refreshDisplay(): void {
-  if (!currentDoc || !currentAppId) return;
+  if (!currentDoc || !currentMode) return;
 
-  const existing = getExistingDisplay(currentDoc);
-  if (!existing) return;
-
-  const cached = getCache(currentAppId);
-  const data = cached?.entry?.data;
-  if (!data) return;
+  // No data yet - nothing to refresh
+  if (!currentAppId || !currentData) return;
 
   const settings = getSettings();
-  existing.replaceWith(createDisplay(currentDoc, settings, data));
-}
+  const existing = getExistingDisplay(currentDoc);
 
-async function handleGamePage(doc: Document, selectors: LibrarySelectors): Promise<void> {
-  const gamePage = detectGamePage(doc, selectors);
-  if (!gamePage) {
-    // Silent return - game page not detected (common during DOM transitions)
+  if (existing) {
+    existing.replaceWith(createDisplay(currentDoc, settings, currentData));
     return;
   }
 
-  const { appId, container } = gamePage;
+  // Display was removed but we still have data - re-detect and inject
+  const gamePage = detectGamePage(currentDoc, currentMode);
+  if (gamePage && gamePage.appId === currentAppId) {
+    gamePage.container.style.position = 'relative';
+    gamePage.container.appendChild(createDisplay(currentDoc, settings, currentData));
+  }
+}
+
+async function handleGamePage(doc: Document, mode: UIMode): Promise<void> {
+  const settings = getSettings();
+  if (!settings.showInLibrary) {
+    removeExistingDisplay(doc);
+    return;
+  }
+
+  const gamePage = detectGamePage(doc, mode);
+  if (!gamePage) {
+    // Clear stale route patch data when no game page is detected
+    if (mode === 'bigpicture') {
+      clearRoutePatchData();
+    }
+    return;
+  }
+
+  const { appId, container, gameName } = gamePage;
 
   // Already processing this specific app - prevent re-entry from MutationObserver
   if (appId === processingAppId) {
@@ -63,8 +85,6 @@ async function handleGamePage(doc: Document, selectors: LibrarySelectors): Promi
   currentDoc = doc;
   log('Found game page for appId:', appId);
 
-  const settings = getSettings();
-
   try {
     removeExistingDisplay(doc);
 
@@ -72,40 +92,39 @@ async function handleGamePage(doc: Document, selectors: LibrarySelectors): Promi
     container.style.position = 'relative';
     container.appendChild(createDisplay(doc, settings)); // undefined data = loading state
 
-    log('Fetching HLTB data for appId:', appId);
-    const result = await fetchHltbData(appId);
+    log('Fetching HLTB data for appId:', appId, gameName ? `(name: ${gameName})` : '');
+    const result = await fetchHltbData(appId, gameName);
 
-    const updateDisplayForApp = (targetAppId: number) => {
+    const updateDisplay = (data: HltbGameResult | null) => {
+      if (!data) return false;
       const existing = getExistingDisplay(doc);
       if (!existing) return false;
 
-      const cached = getCache(targetAppId);
-      const data = cached?.entry?.data;
-
-      if (data) {
-        log('Updating display:', data.game_name || data.searched_name);
-        existing.replaceWith(createDisplay(doc, settings, data));
-        return true;
-      }
-      return false;
+      log('Updating display:', data.game_name || data.searched_name);
+      existing.replaceWith(createDisplay(doc, settings, data));
+      return true;
     };
 
-    // If game changed during fetch, update display for the new game instead
-    if (currentAppId !== null && currentAppId !== appId) {
-      log('Game changed during fetch, updating display for current game:', currentAppId);
-      updateDisplayForApp(currentAppId);
+    // If game changed during fetch, don't update display
+    if (currentAppId !== appId) {
+      log('Game changed during fetch, skipping display update');
       return;
     }
 
-    updateDisplayForApp(appId);
+    // Store and display the data
+    currentData = result.data;
+    updateDisplay(result.data);
 
     // Handle background refresh for stale data
     if (result.refreshPromise) {
-      result.refreshPromise.then((newData) => {
-        if (newData && currentAppId === appId) {
-          updateDisplayForApp(appId);
-        }
-      });
+      result.refreshPromise
+        .then((newData) => {
+          if (newData && currentAppId === appId) {
+            currentData = newData;
+            updateDisplay(newData);
+          }
+        })
+        .catch((e) => log('Background refresh failed:', e));
     }
   } catch (e) {
     log('Error fetching HLTB data:', e);
@@ -117,17 +136,62 @@ async function handleGamePage(doc: Document, selectors: LibrarySelectors): Promi
   }
 }
 
-export function setupObserver(doc: Document, selectors: LibrarySelectors): void {
-  // Clean up existing observer
+// In Big Picture, set up a route patch on /library/app/:appid to get the appId
+// from React's component tree. The patch intercepts renderFunc to extract
+// overview.appid, which is stored for the MutationObserver to pick up.
+function setupRoutePatch(): void {
+  const routerHook = (window as any).__ROUTER_HOOK_INSTANCE;
+  if (!routerHook) {
+    log('Router hook not available, Big Picture will use image fallback only');
+    return;
+  }
+
+  const patchFn = (props: any) => {
+    const renderFunc = props.children?.props?.renderFunc;
+    if (renderFunc) {
+      const orig = renderFunc;
+      props.children.props.renderFunc = (...args: any[]) => {
+        const ret = orig(...args);
+        const overview = ret?.props?.children?.props?.overview;
+        if (overview?.appid) {
+          setRoutePatchData(overview.appid, overview.display_name);
+        }
+        return ret;
+      };
+    }
+    return props;
+  };
+
+  const EUIMODE_GAMEPAD = 4;
+  routerHook.addPatch('/library/app/:appid', patchFn, EUIMODE_GAMEPAD);
+  routePatchCleanup = () => routerHook.removePatch('/library/app/:appid', patchFn, EUIMODE_GAMEPAD);
+  log('Route patch set up for Big Picture mode');
+}
+
+export function setupObserver(doc: Document, mode: UIMode): void {
+  // Clean up existing observer and route patch
   if (observer) {
     observer.disconnect();
     observer = null;
   }
+  if (routePatchCleanup) {
+    routePatchCleanup();
+    routePatchCleanup = null;
+  }
 
+  // Always reset state to prevent stale data from a previous mode/session
+  // (e.g. desktop appId leaking into Big Picture)
+  resetState();
+  currentMode = mode;
+  log('Setting up for', mode, 'mode');
   injectStyles(doc);
 
+  if (mode === 'bigpicture') {
+    setupRoutePatch();
+  }
+
   observer = new MutationObserver(() => {
-    handleGamePage(doc, selectors);
+    handleGamePage(doc, mode);
   });
 
   observer.observe(doc.body, {
@@ -138,12 +202,16 @@ export function setupObserver(doc: Document, selectors: LibrarySelectors): void 
   log('MutationObserver set up');
 
   // Initial check for already-rendered game page
-  handleGamePage(doc, selectors);
+  handleGamePage(doc, mode);
 }
 
 export function disconnectObserver(): void {
   if (observer) {
     observer.disconnect();
     observer = null;
+  }
+  if (routePatchCleanup) {
+    routePatchCleanup();
+    routePatchCleanup = null;
   }
 }

@@ -1,7 +1,7 @@
 --[[
     HLTB API Unit Tests
 
-    Tests for Steam import and direct game fetch functionality.
+    Tests for search authentication, Steam import, and direct game fetching.
     Uses mock HTTP module to test without network calls.
 
     Run with: busted tests/hltb_api_spec.lua
@@ -26,7 +26,10 @@ package.loaded["hltb_endpoint_discovery"] = {
     USER_AGENT = "Mozilla/5.0 Test",
     REFERER_HEADER = "https://howlongtobeat.com/",
     TIMEOUT = 10,
-    get_build_id = function() return "test-build-id" end
+    get_build_id = function() return "test-build-id" end,
+    get_init_url = function() return "https://howlongtobeat.com/api/test/init" end,
+    get_search_url = function() return "https://howlongtobeat.com/api/test" end,
+    invalidate = function() end,
 }
 
 -- Mock HTTP factory for GET requests
@@ -75,6 +78,59 @@ describe("hltb_api", function()
     before_each(function()
         package.loaded["hltb_api"] = nil
         api = require("hltb_api")
+    end)
+
+    describe("search authentication", function()
+        local function search_with_auth(auth)
+            local sent
+            api._http = {
+                get = function()
+                    return { status = 200, body = json.encode(auth) }
+                end,
+                request = function(_, opts)
+                    sent = opts
+                    return { status = 200, body = json.encode({ data = {
+                        { game_id = 2224, game_name = "Dark Souls", comp_all_count = 100 }
+                    } }) }
+                end,
+            }
+            local result = api.search("Dark Souls")
+            return result, sent
+        end
+
+        it("searches with only a token and omits optional auth fields", function()
+            local result, sent = search_with_auth({ token = "test-token" })
+            assert.is_not_nil(result)
+            assert.equals("test-token", sent.headers["x-auth-token"])
+            assert.is_nil(sent.headers["x-hp-key"])
+            assert.is_nil(sent.headers["x-hp-val"])
+            local payload = json.decode(sent.data)
+            assert.is_nil(payload[""])
+            assert.same({ "Dark", "Souls" }, payload.searchTerms)
+            assert.equals(api.SEARCH_SIZE, payload.size)
+        end)
+
+        it("includes supplied auth fields and preserves the payload value type", function()
+            local result, sent = search_with_auth({ token = "test-token", hpKey = "challenge", hpVal = 42 })
+            assert.is_not_nil(result)
+            assert.equals("challenge", sent.headers["x-hp-key"])
+            assert.equals("42", sent.headers["x-hp-val"])
+            assert.equals(42, json.decode(sent.data).challenge)
+        end)
+
+        it("accepts a partial optional pair without adding an incomplete payload field", function()
+            local result, sent = search_with_auth({ token = "test-token", hpKey = "challenge" })
+            assert.is_not_nil(result)
+            assert.equals("challenge", sent.headers["x-hp-key"])
+            assert.is_nil(sent.headers["x-hp-val"])
+            assert.is_nil(json.decode(sent.data).challenge)
+        end)
+
+        it("does not search when the required token is missing", function()
+            local result, sent = search_with_auth({ hpKey = "challenge", hpVal = "value" })
+            assert.is_nil(result)
+            assert.is_nil(sent)
+        end)
     end)
 
     describe("fetch_steam_import", function()
@@ -286,6 +342,47 @@ describe("hltb_api", function()
             local game, err = api.fetch_game_by_id(12345)
             assert.is_nil(game)
             assert.equals("HTTP 404", err)
+        end)
+
+        it("invalidates discovery and retries once on HTTP failure", function()
+            local invalidate_called = 0
+            local build_ids = { "stale-build-id", "fresh-build-id" }
+            local build_idx = 0
+            package.loaded["hltb_endpoint_discovery"] = {
+                BASE_URL = "https://howlongtobeat.com/",
+                USER_AGENT = "Mozilla/5.0 Test",
+                REFERER_HEADER = "https://howlongtobeat.com/",
+                TIMEOUT = 10,
+                get_build_id = function()
+                    build_idx = build_idx + 1
+                    return build_ids[build_idx] or build_ids[#build_ids]
+                end,
+                get_init_url = function() return "https://howlongtobeat.com/api/test/init" end,
+                get_search_url = function() return "https://howlongtobeat.com/api/test" end,
+                invalidate = function() invalidate_called = invalidate_called + 1 end,
+            }
+            package.loaded["hltb_api"] = nil
+            api = require("hltb_api")
+
+            local valid_response = json.encode({
+                pageProps = {
+                    game = {
+                        data = {
+                            game = { { game_id = 99, game_name = "X", comp_main = 1, comp_plus = 2, comp_100 = 3 } }
+                        }
+                    }
+                }
+            })
+            api._http = create_mock_http_get({
+                ["https://howlongtobeat.com/_next/data/stale-build-id/game/99.json"] = { status = 404, body = "" },
+                ["https://howlongtobeat.com/_next/data/fresh-build-id/game/99.json"] = { status = 200, body = valid_response },
+            })
+
+            local game, err = api.fetch_game_by_id(99)
+            assert.is_nil(err)
+            assert.is_not_nil(game)
+            assert.equals(99, game.game_id)
+            assert.equals(1, invalidate_called)
         end)
     end)
 end)
